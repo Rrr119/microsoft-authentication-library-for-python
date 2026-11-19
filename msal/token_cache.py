@@ -641,3 +641,124 @@ class SerializableTokenCache(TokenCache):
             self.has_state_changed = False
             return json.dumps(self._cache, indent=4)
 
+
+class PartitionedTokenCache(object):
+    """A multi-account token cache that keeps each account's tokens isolated.
+
+    Every account (identified by its ``home_account_id``, i.e. ``uid.utid``)
+    gets its own independent :class:`SerializableTokenCache` partition.
+    Applications authenticate once per account against the partition returned
+    by :meth:`for_account`, so credentials belonging to one account can never
+    be looked up by, leaked to, or evicted through another account::
+
+        cache = msal.PartitionedTokenCache()
+        app_for_account_a = msal.PublicClientApplication(
+            "client_id", token_cache=cache.for_account("uid_a.utid_a"))
+
+        # Persist all partitions atomically
+        open("cache.json", "w").write(cache.serialize())
+        cache.deserialize(open("cache.json", "r").read())
+
+    The object itself also behaves as a token cache *after* a partition has
+    been selected via :meth:`for_account`: all standard
+    :class:`TokenCache` operations (``search``, ``add``, ``remove_rt`` ...)
+    are delegated to that active partition. This lets existing code that
+    receives an opaque ``token_cache`` keep working unchanged.
+
+    App-only tokens (client-credentials flow, whose entries have no
+    ``home_account_id``) live in a dedicated ``None``-keyed partition.
+    """
+
+    _APP_ONLY_PARTITION = None  # Key for account-less (client-credentials) tokens
+
+    _CREDENTIAL_TYPES = frozenset((
+        TokenCache.CredentialType.ACCESS_TOKEN,
+        TokenCache.CredentialType.ACCESS_TOKEN_EXTENDED,
+        TokenCache.CredentialType.REFRESH_TOKEN,
+        TokenCache.CredentialType.ACCOUNT,
+        TokenCache.CredentialType.ID_TOKEN,
+        TokenCache.CredentialType.APP_METADATA,
+    ))
+
+    def __init__(self):
+        self._partitions = {}  # type: dict
+        self._active_partition_key = self._APP_ONLY_PARTITION
+
+    def for_account(self, home_account_id):
+        """Select (creating if needed) the partition for *home_account_id*.
+
+        :param home_account_id:
+            The account's home account id, typically the
+            ``"home_account_id"`` field of an account object returned by
+            :func:`ClientApplication.get_accounts`. ``None`` selects the
+            app-only partition used by the client-credentials flow.
+        :return:
+            The :class:`SerializableTokenCache` partition for this account.
+        """
+        if home_account_id is not None and not isinstance(home_account_id, str):
+            raise ValueError(
+                "home_account_id must be a string or None, got {}".format(
+                    type(home_account_id).__name__))
+        if home_account_id not in self._partitions:
+            self._partitions[home_account_id] = SerializableTokenCache()
+        self._active_partition_key = home_account_id
+        return self._partitions[home_account_id]
+
+    @property
+    def active_partition(self):
+        """The currently selected partition (created lazily)."""
+        return self.for_account(self._active_partition_key)
+
+    @property
+    def has_state_changed(self):
+        """``True`` if any partition changed since the last (de)serialization."""
+        return any(
+            partition.has_state_changed
+            for partition in self._partitions.values())
+
+    def serialize(self):
+        # type: () -> str
+        """Serialize every partition into a single JSON string."""
+        state = {
+            # JSON object keys must be strings; the app-only partition uses "".
+            "" if key is None else key: partition._cache
+            for key, partition in self._partitions.items()}
+        for partition in self._partitions.values():
+            partition.has_state_changed = False
+        return json.dumps(state, indent=4)
+
+    def deserialize(self, state):
+        # type: (Optional[str]) -> None
+        """Load partitions previously produced by :meth:`serialize`.
+
+        For backward compatibility, a plain :class:`SerializableTokenCache`
+        blob (whose top level is keyed by credential type rather than account
+        id) is accepted and loaded into the app-only partition.
+        """
+        if not state:
+            self._partitions = {}
+            self._active_partition_key = self._APP_ONLY_PARTITION
+            return
+        loaded = json.loads(state)
+        self._partitions = {}
+        if (isinstance(loaded, dict) and loaded
+                and all(key in self._CREDENTIAL_TYPES for key in loaded)):
+            # Legacy single-partition blob: top level is keyed by credential
+            # type (AccessToken/RefreshToken/...) rather than account id.
+            partition = SerializableTokenCache()
+            partition.deserialize(json.dumps(loaded))
+            self._partitions[self._APP_ONLY_PARTITION] = partition
+            self._active_partition_key = self._APP_ONLY_PARTITION
+            return
+        for key, partition_state in loaded.items():
+            partition = SerializableTokenCache()
+            partition.deserialize(json.dumps(partition_state))
+            self._partitions[None if key == "" else key] = partition
+        self._active_partition_key = self._APP_ONLY_PARTITION
+
+    def __getattr__(self, name):
+        # Delegate the standard TokenCache API to the active partition.
+        # __getattr__ only runs for names not found on this object, so
+        # for_account/serialize/... and instance attributes are never intercepted.
+        return getattr(self.active_partition, name)
+

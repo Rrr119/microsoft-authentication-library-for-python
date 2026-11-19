@@ -1130,6 +1130,8 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
         # Note to maintainers: Do not emit warning for the use of response_mode here,
         # because response_mode=form_post is still the recommended usage for MSAL Python 1.x.
         # App developers making the right call shall not be disturbed by unactionable warnings.
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         client = _ClientWithCcsRoutingInfo(
             {"authorization_endpoint": self.authority.authorization_endpoint},
             self.client_id,
@@ -1564,6 +1566,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             claims_challenge=None,
             forwarded_client_claims=None,
             auth_scheme=None,
+            allow_offline_access=False,
             **kwargs):
         """Acquire an access token for given account, without user interaction.
 
@@ -1582,12 +1585,15 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
         """
         if not account:
             return None  # A backward-compatible NO-OP to drop the account=None usage
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         if forwarded_client_claims is not None:
             kwargs["data"] = kwargs.get("data", {})
             _stash_client_claims(forwarded_client_claims, kwargs["data"])
         result = _clean_up(self._acquire_token_silent_with_error(
             scopes, account, authority=authority, force_refresh=force_refresh,
-            claims_challenge=claims_challenge, auth_scheme=auth_scheme, **kwargs))
+            claims_challenge=claims_challenge, auth_scheme=auth_scheme,
+            allow_offline_access=allow_offline_access, **kwargs))
         return result if result and "error" not in result else None
 
     def acquire_token_silent_with_error(
@@ -1599,6 +1605,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             claims_challenge=None,
             forwarded_client_claims=None,
             auth_scheme=None,
+            allow_offline_access=False,
             **kwargs):
         """Acquire an access token for given account, without user interaction.
 
@@ -1641,6 +1648,19 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             so that MSAL will get a Proof-of-Possession (POP) token for you.
 
             New in version 1.26.0.
+        :param bool allow_offline_access:
+            Optional, defaults to ``False``. When ``True`` and the identity
+            provider is unreachable (a network-level error) while the cached
+            access token is expired, MSAL will serve the expired token from
+            cache instead of propagating the network exception. The returned
+            dict is marked with ``"offline": True`` and its
+            ``"token_source"`` is ``"cache"``. This is an explicit opt-in
+            graceful-degradation path: the resource may still reject the
+            expired token. It has no effect when a (non-network) error
+            response is returned, and it is ignored when a
+            *claims_challenge* is present, because a CAE challenge means the
+            cached token was already revoked by the resource and must not be
+            replayed.
 
         :return:
             - A dict containing no "error" key,
@@ -1651,12 +1671,15 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
         """
         if not account:
             return None  # A backward-compatible NO-OP to drop the account=None usage
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         if forwarded_client_claims is not None:
             kwargs["data"] = kwargs.get("data", {})
             _stash_client_claims(forwarded_client_claims, kwargs["data"])
         return _clean_up(self._acquire_token_silent_with_error(
             scopes, account, authority=authority, force_refresh=force_refresh,
-            claims_challenge=claims_challenge, auth_scheme=auth_scheme, **kwargs))
+            claims_challenge=claims_challenge, auth_scheme=auth_scheme,
+            allow_offline_access=allow_offline_access, **kwargs))
 
     def _acquire_token_silent_with_error(
             self,
@@ -1666,6 +1689,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             force_refresh=False,  # type: Optional[boolean]
             claims_challenge=None,
             auth_scheme=None,
+            allow_offline_access=False,
             **kwargs):
         assert isinstance(scopes, list), "Invalid parameter type"
         self._validate_ssh_cert_input_data(kwargs.get("data", {}))
@@ -1682,6 +1706,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             claims_challenge=claims_challenge,
             correlation_id=correlation_id,
             auth_scheme=auth_scheme,
+            allow_offline_access=allow_offline_access,
             **kwargs)
         if result and "error" not in result:
             return result
@@ -1705,6 +1730,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
                 claims_challenge=claims_challenge,
                 correlation_id=correlation_id,
                 auth_scheme=auth_scheme,
+                allow_offline_access=allow_offline_access,
                 **kwargs)
             if result:
                 if "error" not in result:
@@ -1730,11 +1756,14 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             correlation_id=None,
             http_exceptions=None,
             auth_scheme=None,
+            allow_offline_access=False,
             **kwargs):
         # This internal method has two calling patterns:
         # it accepts a non-empty account to find token for a user,
         # and accepts account=None to find a token for the current app.
         access_token_from_cache = None
+        expired_access_token_from_cache = None  # Last-resort offline fallback
+        now = time.time()
         if not (force_refresh or claims_challenge or auth_scheme):  # Then attempt AT cache
             query={
                     "client_id": self.client_id,
@@ -1748,7 +1777,6 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             ext_cache_key = _compute_ext_cache_key(kwargs.get("data", {}))
             if ext_cache_key:  # FMI tokens need cache isolation by path
                 query["ext_cache_key"] = ext_cache_key
-            now = time.time()
             refresh_reason = msal.telemetry.AT_ABSENT
             for entry in self.token_cache.search(  # A generator allows us to
                     # break early in cache-hit without finding a full list
@@ -1761,6 +1789,9 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
                 expires_in = int(entry["expires_on"]) - now
                 if expires_in < 5*60:  # Then consider it expired
                     refresh_reason = msal.telemetry.AT_EXPIRED
+                    # search() will purge expired entries, so keep a snapshot for
+                    # the allow_offline_access fallback below.
+                    expired_access_token_from_cache = entry
                     continue  # Removal is not necessary, it will be overwritten
                 logger.debug("Cache hit an AT")
                 access_token_from_cache = {  # Mimic a real response
@@ -1778,6 +1809,14 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
                 return access_token_from_cache  # It is still good as new
         else:
             refresh_reason = msal.telemetry.FORCE_REFRESH  # TODO: It could also mean claims_challenge
+        if (allow_offline_access
+                and (force_refresh or claims_challenge or auth_scheme)
+                and not expired_access_token_from_cache):
+            # The AT cache lookup was skipped above; look it up directly so an
+            # offline fallback remains available. (For a claims challenge this
+            # entry is still never served -- see the handler below.)
+            expired_access_token_from_cache = self._find_access_token_entry(
+                scopes, account, authority, kwargs.get("data", {}))
         assert refresh_reason, "It should have been established at this point"
         if not http_exceptions:  # It can be a tuple of exceptions
             # The exact HTTP exceptions are transportation-layer dependent
@@ -1832,9 +1871,59 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
                 return result
         except http_exceptions:
             # Typically network error. Potential AAD outage?
-            if not access_token_from_cache:  # It means there is no fall back option
-                raise  # We choose to bubble up the exception
+            # A CAE claims challenge explicitly invalidates the cached AT: the
+            # resource already rejected it, so it must never be served again,
+            # even when the refresh request fails due to a network outage.
+            if claims_challenge:
+                raise
+            if access_token_from_cache:  # An aging (still valid) AT is in hand
+                return access_token_from_cache
+            if allow_offline_access:
+                expired_at = expired_access_token_from_cache or (
+                    # Claims/auth-scheme path skipped the AT lookup above
+                    self._find_access_token_entry(
+                        scopes, account, authority, kwargs.get("data", {})))
+                if expired_at:
+                    return self._build_offline_access_token_response(expired_at, now)
+            raise  # No fall back option; bubble up the exception
         return access_token_from_cache
+
+    def _find_access_token_entry(self, scopes, account, authority, data):
+        """Return the cached AT entry matching *scopes*/*account*, or ``None``.
+
+        Unlike :meth:`TokenCache.search`, this O(1) lookup does not purge
+        expired entries, so it can surface an expired AT for offline use.
+        """
+        ext_cache_key = _compute_ext_cache_key(data or {})
+        # ATs seeded via non-silent flows are keyed on the caller's scopes,
+        # while ATs minted by an RT refresh are keyed on the decorated scopes
+        # (openid/profile/offline_access added). Try both key shapes.
+        candidate_targets = [sorted(scopes)]
+        if account:
+            candidate_targets.append(sorted(self._decorate_scope(scopes)))
+        for target in candidate_targets:
+            entry = self.token_cache._get_access_token(
+                home_account_id=(account or {}).get("home_account_id"),
+                environment=authority.instance,
+                client_id=self.client_id,
+                realm=authority.tenant,
+                target=target,
+                ext_cache_key=ext_cache_key or None,
+                default=None)
+            if entry and set(scopes) <= set(entry.get("target", "").split()):
+                return entry
+        return None
+
+    @staticmethod
+    def _build_offline_access_token_response(entry, now):
+        """Mimic a token response for an expired AT served while offline."""
+        return {
+            "access_token": entry["secret"],
+            "token_type": entry.get("token_type", "Bearer"),
+            "expires_in": max(0, int(entry["expires_on"]) - int(now)),
+            ClientApplication._TOKEN_SOURCE: ClientApplication._TOKEN_SOURCE_CACHE,
+            "offline": True,
+        }
 
     def _process_broker_response(self, response, scopes, data):
         if "error" not in response:
@@ -2050,6 +2139,8 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
         Migration guide: https://aka.ms/msal-ropc-migration
 
         """
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         is_confidential_app = self.client_credential or isinstance(
             self, ConfidentialClientApplication)
         if not is_confidential_app:
@@ -2554,6 +2645,8 @@ class PublicClientApplication(ClientApplication):  # browser app or mobile app
             - A successful response would contain "user_code" key, among others
             - an error response would contain some other readable key/value pairs.
         """
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         correlation_id = msal.telemetry._get_new_correlation_id()
         flow = self.client.initiate_device_flow(
             scope=self._decorate_scope(scopes or []),
@@ -2583,6 +2676,8 @@ class PublicClientApplication(ClientApplication):  # browser app or mobile app
             - A successful response would contain "access_token" key,
             - an error response would contain "error" and usually "error_description".
         """
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         telemetry_context = self._build_telemetry_context(
             self.ACQUIRE_TOKEN_BY_DEVICE_FLOW_ID,
             correlation_id=flow.get(self.DEVICE_FLOW_CORRELATION_ID))
@@ -2654,6 +2749,8 @@ class ConfidentialClientApplication(ClientApplication):  # server-side web app
             raise ValueError(  # We choose to disallow force_refresh
                 "Historically, this method does not support force_refresh behavior. "
             )
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         if fmi_path is not None:
             if not isinstance(fmi_path, str):
                 raise ValueError(
@@ -2756,6 +2853,8 @@ class ConfidentialClientApplication(ClientApplication):  # server-side web app
             - A successful response would contain "access_token" key,
             - an error response would contain "error" and usually "error_description".
         """
+        if claims_challenge is not None:
+            _parse_claims_or_raise(claims_challenge)  # Fail fast on malformed JSON
         telemetry_context = self._build_telemetry_context(
             self.ACQUIRE_TOKEN_ON_BEHALF_OF_ID)
         _data = kwargs.pop("data", {})
