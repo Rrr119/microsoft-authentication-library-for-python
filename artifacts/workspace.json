@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid52944",
+  "B": "/home/dev/feedback/uid52944",
+  "sha": "8912567738ed731542370b56fb8a2b44e95d45c8",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "AzureAD",
+    "repo": "microsoft-authentication-library-for-python",
+    "sha": "8912567738ed731542370b56fb8a2b44e95d45c8"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "microsoft-authentication-library-for-python",
+    "cloneUrl": "https://github.com/Rrr119/microsoft-authentication-library-for-python.git"
+  },
+  "at": "2026-11-28T16:00:36.532Z"
+}

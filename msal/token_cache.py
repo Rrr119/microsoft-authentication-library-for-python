@@ -375,6 +375,10 @@ class TokenCache(object):
 
     def add(self, event, now=None):
         """Handle a token obtaining event, and add tokens into cache."""
+        if now is None:
+            # Callers with a corrected clock (e.g. clock skew correction)
+            # may provide the reference timestamp inside the event itself.
+            now = event.get("now")
         def make_clean_copy(dictionary, sensitive_fields):  # Masks sensitive info
             return {
                 k: "********" if k in sensitive_fields else v

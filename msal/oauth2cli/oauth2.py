@@ -19,6 +19,7 @@ import string
 import hashlib
 
 from .authcode import AuthCodeReceiver as _AuthCodeReceiver
+from .clock_skew import ClockSkewCorrector
 
 try:
     PermissionError  # Available in Python 3
@@ -69,6 +70,7 @@ class BaseClient(object):
             verify=None,  # type: Union[str, True, False, None]
             proxies=None,  # type: Optional[dict]
             timeout=None,  # type: Union[tuple, float, None]
+            clock_skew_corrector=None,  # type: Optional[ClockSkewCorrector]
             ):
         """Initialize a client object to talk all the OAuth2 grants to the server.
 
@@ -177,6 +179,8 @@ class BaseClient(object):
             self._http_client.request = functools.partial(
                 # A workaround for requests not supporting session-wide timeout
                 self._http_client.request, timeout=timeout)
+        self._clock_skew_corrector = (
+            clock_skew_corrector or ClockSkewCorrector())
 
     @staticmethod
     def _accepts_context(func):
@@ -291,6 +295,10 @@ class BaseClient(object):
             self.configuration["token_endpoint"],
             headers=_headers, params=params, data=_data,
             **kwargs)
+        # Learn the server-vs-local clock offset for cache bookkeeping.
+        # Some http responses (and many test doubles) have no headers at all.
+        self._clock_skew_corrector.observe_response_headers(
+            getattr(resp, "headers", None))
         if resp.status_code >= 500:
             resp.raise_for_status()  # TODO: Will probably retry here
         try:
@@ -885,14 +893,21 @@ class Client(BaseClient):  # We choose to implement all 4 grants in 1 class
                 #       but our obtain_token_by_authorization_code(...) encourages
                 #       app developer to still explicitly provide a scope here.
                 scope = _data.get("scope")
-            (on_obtaining_tokens or self.on_obtaining_tokens)({
+            event = {
                 "client_id": self.client_id,
                 "scope": scope,
                 "token_endpoint": self.configuration["token_endpoint"],
                 "grant_type": grant_type,  # can be used to know an IdToken-less
                                            # response is for an app or for a user
                 "response": _resp, "params": params, "data": _data,
-                })
+                }
+            if self._clock_skew_corrector.correction_active:
+                # TokenCache.add() honors an optional "now" in the event,
+                # so cache timestamps are computed in server time.
+                # When no significant skew was detected, we deliberately
+                # omit "now" to keep the normal cache path untouched.
+                event["now"] = int(self._clock_skew_corrector.now())
+            (on_obtaining_tokens or self.on_obtaining_tokens)(event)
         return resp
 
     def obtain_token_by_refresh_token(self, token_item, scope=None,

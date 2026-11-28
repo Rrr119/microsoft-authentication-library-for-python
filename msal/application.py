@@ -11,7 +11,9 @@ from urllib.parse import urlparse
 import os
 
 from .oauth2cli import Client, JwtAssertionCreator
+from .oauth2cli.clock_skew import ClockSkewCorrector
 from .oauth2cli.oidc import decode_part
+from .diagnostics import diagnose_error
 from .authority import (
     Authority,
     WORLD_WIDE,
@@ -767,6 +769,9 @@ class ClientApplication(object):
         self.token_cache = token_cache or TokenCache()
         self._region_configured = azure_region
         self._region_detected = None
+        # Shared by all oauth2 clients built by this app, so that a skew
+        # learned from one token response benefits subsequent operations.
+        self._clock_skew_corrector = ClockSkewCorrector()
         self.client, self._regional_client = self._build_client(
             client_credential, self.authority)
         # Warn if using a static string/bytes client_assertion (discouraged for long-running apps)
@@ -1007,6 +1012,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             default_body=default_body,
             client_assertion=client_assertion,
             client_assertion_type=client_assertion_type,
+            clock_skew_corrector=self._clock_skew_corrector,
             on_obtaining_tokens=lambda event: self.token_cache.add(dict(
                 event, environment=authority.instance)),
             on_removing_rt=self.token_cache.remove_rt,
@@ -1031,6 +1037,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
                     default_body=default_body,
                     client_assertion=client_assertion,
                     client_assertion_type=client_assertion_type,
+                    clock_skew_corrector=self._clock_skew_corrector,
                     on_obtaining_tokens=lambda event: self.token_cache.add(dict(
                         event, environment=authority.instance)),
                     on_removing_rt=self.token_cache.remove_rt,
@@ -1748,7 +1755,7 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             ext_cache_key = _compute_ext_cache_key(kwargs.get("data", {}))
             if ext_cache_key:  # FMI tokens need cache isolation by path
                 query["ext_cache_key"] = ext_cache_key
-            now = time.time()
+            now = self._clock_skew_corrector.now()  # == time.time() when no skew
             refresh_reason = msal.telemetry.AT_ABSENT
             for entry in self.token_cache.search(  # A generator allows us to
                     # break early in cache-hit without finding a full list
@@ -1951,10 +1958,17 @@ The reserved list: {}""".format(list(scope_set), list(reserved_scope)))
             telemetry_context.update_telemetry(response)
             if "error" not in response:
                 return response
-            logger.debug("Refresh failed. {error}: {error_description}".format(
-                error=response.get("error"),
-                error_description=response.get("error_description"),
-                ))
+            diagnostic = diagnose_error(
+                response,
+                clock_skew_seconds=self._clock_skew_corrector.skew_seconds)
+            logger.debug(
+                "Refresh failed. {error}: {error_description}. "
+                "Diagnostics ({error_type}): {advice}".format(
+                    error=response.get("error"),
+                    error_description=response.get("error_description"),
+                    error_type=diagnostic["error_type"],
+                    advice=diagnostic["actionable_advice"],
+                    ))
             if break_condition(response):
                 break
         return response  # Returns the latest error (if any), or just None
